@@ -1249,20 +1249,26 @@ def get_events_api():
 def get_status_api():
     """Get current MT40 power status"""
     try:
-        # Get recent commands to determine current state
-        commands = dashboard.sensor.getDeviceSensorCommands(MT40_SERIAL)
+        # Query the actual current state from the dashboard
+        readings = dashboard.sensor.getOrganizationSensorReadingsLatest(
+            ORG_ID,
+            serials=[MT40_SERIAL],
+            metrics=['downstreamPower']
+        )
 
-        # Find the most recent completed power command
         current_state = 'unknown'
         last_update = None
 
-        for cmd in commands:
-            operation = cmd.get('operation', '')
-            status = cmd.get('status', '')
-
-            if status == 'completed' and operation in ['enableDownstreamPower', 'disableDownstreamPower']:
-                current_state = 'on' if operation == 'enableDownstreamPower' else 'off'
-                last_update = cmd.get('completedAt', cmd.get('sentAt'))
+        for reading in readings:
+            if reading.get('serial') == MT40_SERIAL:
+                downstream_power = reading.get('readings', [])
+                for r in downstream_power:
+                    if r.get('metric') == 'downstreamPower':
+                        enabled = r.get('downstreamPower', {}).get('enabled')
+                        if enabled is not None:
+                            current_state = 'on' if enabled else 'off'
+                        last_update = r.get('ts')
+                        break
                 break
 
         return jsonify({
