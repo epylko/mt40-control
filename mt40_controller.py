@@ -61,7 +61,17 @@ scheduler.start()
 event_history = deque(maxlen=100)
 
 # Runtime debug mode control (can be changed via API)
-debug_mode_state = {'mode': DEBUG_MODE}
+# Each action type can be independently set to debug mode
+def parse_debug_mode(mode_str):
+    """Parse DEBUG_MODE env var to individual toggles"""
+    mode = mode_str.lower() if mode_str else ''
+    return {
+        'webhook': mode in ('webhook', 'all'),
+        'schedule': mode in ('schedule', 'all'),
+        'manual': mode in ('manual', 'all')
+    }
+
+debug_mode_state = parse_debug_mode(DEBUG_MODE)
 
 # Long press confirmation tracking (for double press to turn off)
 long_press_pending = {'timestamp': None, 'timeout_seconds': LONG_PRESS_TIMEOUT}
@@ -119,19 +129,10 @@ def control_mt40_power(action, source='unknown'):
         return False
 
     # Check if this action should be skipped due to debug mode
-    current_debug_mode = debug_mode_state['mode']
-    skip_action = False
-    if current_debug_mode == 'all':
-        skip_action = True
-    elif current_debug_mode == 'webhook' and source == 'webhook':
-        skip_action = True
-    elif current_debug_mode == 'schedule' and source == 'schedule':
-        skip_action = True
-    elif current_debug_mode == 'manual' and source == 'manual':
-        skip_action = True
+    skip_action = debug_mode_state.get(source, False)
 
     if skip_action:
-        logger.info(f"[DEBUG MODE - {source.upper()}] Would send {operation} command to MT40 ({MT40_SERIAL}), but skipping due to DEBUG_MODE={current_debug_mode}")
+        logger.info(f"[DEBUG MODE - {source.upper()}] Would send {operation} command to MT40 ({MT40_SERIAL}), but skipping due to debug enabled for {source}")
         logger.info(f"[DEBUG MODE] MT40 power {action.upper()} - ACTION SKIPPED")
         # Log event
         event_history.append({
@@ -508,21 +509,36 @@ def admin_ui():
             color: #666;
             margin-bottom: 0;
         }
-        .message {
-            padding: 12px;
-            margin-bottom: 20px;
-            border-radius: 4px;
+        .toast {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            padding: 12px 20px;
+            border-radius: 6px;
             display: none;
+            z-index: 1000;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+            max-width: 350px;
+            animation: slideIn 0.3s ease;
         }
-        .message.success {
+        @keyframes slideIn {
+            from { transform: translateX(100%); opacity: 0; }
+            to { transform: translateX(0); opacity: 1; }
+        }
+        .toast.success {
             background: #d4edda;
             color: #155724;
             border: 1px solid #c3e6cb;
         }
-        .message.error {
+        .toast.error {
             background: #f8d7da;
             color: #721c24;
             border: 1px solid #f5c6cb;
+        }
+        .version {
+            font-size: 12px;
+            color: #999;
+            margin-top: 5px;
         }
         .form-section {
             background: #f8f9fa;
@@ -651,24 +667,53 @@ def admin_ui():
             display: flex;
             gap: 8px;
         }
-        .control-section {
+        .power-control-bar {
             display: flex;
-            gap: 15px;
+            align-items: center;
             justify-content: center;
-            margin-bottom: 30px;
+            gap: 15px;
+            margin-bottom: 25px;
+            padding: 12px 20px;
+            background: #f8f9fa;
+            border-radius: 6px;
+        }
+        .power-control-bar .label {
+            font-weight: 500;
+            color: #555;
+        }
+        .power-status {
+            display: inline-block;
+            padding: 6px 16px;
+            border-radius: 16px;
+            font-weight: 600;
+            font-size: 14px;
+            min-width: 70px;
+            text-align: center;
+        }
+        .power-status.on {
+            background: #28a745;
+            color: white;
+        }
+        .power-status.off {
+            background: #dc3545;
+            color: white;
+        }
+        .power-status.unknown {
+            background: #6c757d;
+            color: white;
         }
         .btn-control {
-            padding: 15px 40px;
-            font-size: 16px;
-            font-weight: 600;
+            padding: 8px 20px;
+            font-size: 14px;
+            font-weight: 500;
             border: none;
-            border-radius: 6px;
+            border-radius: 4px;
             cursor: pointer;
             transition: all 0.2s;
         }
         .btn-control:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+            transform: translateY(-1px);
+            box-shadow: 0 2px 6px rgba(0,0,0,0.15);
         }
         .btn-power-on {
             background: #28a745;
@@ -684,49 +729,73 @@ def admin_ui():
         .btn-power-off:hover {
             background: #c82333;
         }
-        .status-display {
-            text-align: center;
-            margin-bottom: 30px;
-            padding: 15px;
-            background: #f8f9fa;
-            border-radius: 6px;
-        }
-        .status-display h3 {
-            margin-bottom: 10px;
-            color: #333;
-            font-size: 16px;
-        }
-        .power-status {
-            display: inline-block;
-            padding: 8px 20px;
-            border-radius: 20px;
-            font-weight: 600;
-            font-size: 18px;
-        }
-        .power-status.on {
-            background: #28a745;
-            color: white;
-        }
-        .power-status.off {
-            background: #dc3545;
-            color: white;
-        }
-        .power-status.unknown {
-            background: #6c757d;
-            color: white;
-        }
         #debugSection {
             border: 2px solid #ffc107;
             background: #fff3cd;
         }
-        #currentDebugMode {
-            background: #e9ecef;
-            color: #495057;
+        .debug-toggle-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 12px 16px;
+            background: white;
+            border-radius: 6px;
+            margin-bottom: 10px;
+            border: 1px solid #ddd;
         }
-        #currentDebugMode.active {
-            background: #ffc107;
-            color: #000;
-            font-weight: 600;
+        .debug-toggle-row:last-child {
+            margin-bottom: 0;
+        }
+        .debug-toggle-label {
+            font-weight: 500;
+            color: #333;
+        }
+        .toggle-switch {
+            position: relative;
+            width: 50px;
+            height: 26px;
+        }
+        .toggle-switch input {
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+        .toggle-slider {
+            position: absolute;
+            cursor: pointer;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background-color: #ccc;
+            transition: 0.3s;
+            border-radius: 26px;
+        }
+        .toggle-slider:before {
+            position: absolute;
+            content: "";
+            height: 20px;
+            width: 20px;
+            left: 3px;
+            bottom: 3px;
+            background-color: white;
+            transition: 0.3s;
+            border-radius: 50%;
+        }
+        .toggle-switch input:checked + .toggle-slider {
+            background-color: #ffc107;
+        }
+        .toggle-switch input:checked + .toggle-slider:before {
+            transform: translateX(24px);
+        }
+        .debug-note {
+            color: #856404;
+            font-size: 0.9em;
+            margin-top: 15px;
+            padding: 10px 12px;
+            background: rgba(255, 193, 7, 0.2);
+            border-radius: 4px;
+            border-left: 3px solid #ffc107;
         }
     </style>
 </head>
@@ -736,42 +805,38 @@ def admin_ui():
             <div id="clock" class="clock">--:--:--</div>
             <h1>MT40 Schedule Manager</h1>
             <p class="subtitle">Manage power on/off schedules</p>
+            <p class="version">v1.2.0</p>
         </div>
 
-        <div id="message" class="message"></div>
+        <div id="toast" class="toast"></div>
 
-        <div class="status-display">
-            <h3>Current Power Status</h3>
-            <div id="powerStatus" class="power-status unknown">Loading...</div>
+        <div class="power-control-bar">
+            <span class="label">Power Status:</span>
+            <span id="powerStatus" class="power-status unknown">...</span>
+            <span class="label" style="margin-left: 10px;">Set Power:</span>
+            <button class="btn-control btn-power-on" onclick="manualPowerControl('on')">ON</button>
+            <button class="btn-control btn-power-off" onclick="manualPowerControl('off')">OFF</button>
         </div>
 
-        <div class="control-section">
-            <button class="btn-control btn-power-on" onclick="manualPowerControl('on')">⚡ Power ON</button>
-            <button class="btn-control btn-power-off" onclick="manualPowerControl('off')">⏻ Power OFF</button>
-        </div>
-
-        <div class="form-section" id="debugSection">
-            <h2>Debug Mode</h2>
-            <p style="color: #666; margin-bottom: 15px;">Test power commands without affecting the actual device</p>
-
-            <div style="margin-bottom: 20px; padding: 12px; background: white; border-radius: 4px; border: 1px solid #ddd;">
-                <strong>Current Mode:</strong>
-                <span id="currentDebugMode" style="margin-left: 10px; padding: 4px 12px; border-radius: 4px; font-weight: 500;">
-                    Loading...
-                </span>
-            </div>
-
-            <div style="display: flex; align-items: center; gap: 15px;">
-                <label style="margin-bottom: 0; font-weight: 500;">Set Mode:</label>
-                <select id="debugModeSelect" style="width: auto; flex: 1; max-width: 300px;">
-                    <option value="">Disabled (Normal Operation)</option>
-                    <option value="manual">Manual Only</option>
-                    <option value="webhook">Webhook Only</option>
-                    <option value="schedule">Schedule Only</option>
-                    <option value="all">All Actions</option>
-                </select>
-                <button onclick="applyDebugMode()" class="btn-primary">Apply</button>
-            </div>
+        <div class="form-section">
+            <h2>Current Schedules</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Name</th>
+                        <th>Action</th>
+                        <th>Time</th>
+                        <th>Days</th>
+                        <th>Status</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="scheduleTable">
+                    <tr>
+                        <td colspan="6" style="text-align: center; color: #999;">Loading...</td>
+                    </tr>
+                </tbody>
+            </table>
         </div>
 
         <div class="form-section">
@@ -816,27 +881,6 @@ def admin_ui():
         </div>
 
         <div class="form-section">
-            <h2>Current Schedules</h2>
-            <table>
-                <thead>
-                    <tr>
-                        <th>Name</th>
-                        <th>Action</th>
-                        <th>Time</th>
-                        <th>Days</th>
-                        <th>Status</th>
-                        <th>Actions</th>
-                    </tr>
-                </thead>
-                <tbody id="scheduleTable">
-                    <tr>
-                        <td colspan="6" style="text-align: center; color: #999;">Loading...</td>
-                    </tr>
-                </tbody>
-            </table>
-        </div>
-
-        <div class="form-section">
             <h2>Recent Events</h2>
             <table>
                 <thead>
@@ -854,18 +898,51 @@ def admin_ui():
                 </tbody>
             </table>
         </div>
+
+        <div class="form-section" id="debugSection">
+            <h2>Debug Mode</h2>
+            <p style="color: #666; margin-bottom: 15px;">Test power commands without affecting the actual device</p>
+
+            <div class="debug-toggle-row">
+                <span class="debug-toggle-label">Manual (UI Buttons)</span>
+                <label class="toggle-switch">
+                    <input type="checkbox" id="debugManual" onchange="updateDebugMode('manual', this.checked)">
+                    <span class="toggle-slider"></span>
+                </label>
+            </div>
+
+            <div class="debug-toggle-row">
+                <span class="debug-toggle-label">Webhook (MT30 Button)</span>
+                <label class="toggle-switch">
+                    <input type="checkbox" id="debugWebhook" onchange="updateDebugMode('webhook', this.checked)">
+                    <span class="toggle-slider"></span>
+                </label>
+            </div>
+
+            <div class="debug-toggle-row">
+                <span class="debug-toggle-label">Schedule (Automated)</span>
+                <label class="toggle-switch">
+                    <input type="checkbox" id="debugSchedule" onchange="updateDebugMode('schedule', this.checked)">
+                    <span class="toggle-slider"></span>
+                </label>
+            </div>
+
+            <div class="debug-note">
+                Enabling debug for an action prevents it from changing the power status.
+            </div>
+        </div>
     </div>
 
     <script>
         let schedules = [];
 
         function showMessage(text, type) {
-            const msg = document.getElementById('message');
-            msg.textContent = text;
-            msg.className = 'message ' + type;
-            msg.style.display = 'block';
+            const toast = document.getElementById('toast');
+            toast.textContent = text;
+            toast.className = 'toast ' + type;
+            toast.style.display = 'block';
             setTimeout(() => {
-                msg.style.display = 'none';
+                toast.style.display = 'none';
             }, 3000);
         }
 
@@ -907,28 +984,17 @@ def admin_ui():
 
                 if (state === 'on') {
                     statusEl.classList.add('on');
-                    statusEl.textContent = '⚡ ON';
+                    statusEl.textContent = 'ON';
                 } else if (state === 'off') {
                     statusEl.classList.add('off');
-                    statusEl.textContent = '⏻ OFF';
+                    statusEl.textContent = 'OFF';
                 } else {
                     statusEl.classList.add('unknown');
-                    statusEl.textContent = '? UNKNOWN';
+                    statusEl.textContent = '?';
                 }
             } catch (error) {
                 console.error('Error loading power status:', error);
             }
-        }
-
-        function getDebugModeLabel(mode) {
-            const labels = {
-                '': 'Disabled (Normal Operation)',
-                'manual': 'Manual Only',
-                'webhook': 'Webhook Only',
-                'schedule': 'Schedule Only',
-                'all': 'All Actions'
-            };
-            return labels[mode] || mode;
         }
 
         async function loadDebugMode() {
@@ -937,54 +1003,42 @@ def admin_ui():
                 if (!response.ok) throw new Error('Failed to load debug mode');
                 const data = await response.json();
 
-                const currentModeEl = document.getElementById('currentDebugMode');
-                const debugSelect = document.getElementById('debugModeSelect');
-
-                // Update current mode display
-                const modeLabel = getDebugModeLabel(data.debug_mode);
-                currentModeEl.textContent = modeLabel;
-
-                // Highlight if debug mode is active
-                if (data.debug_mode) {
-                    currentModeEl.classList.add('active');
-                } else {
-                    currentModeEl.classList.remove('active');
-                }
-
-                // Set the selector to current mode
-                debugSelect.value = data.debug_mode;
+                // Update toggle states
+                document.getElementById('debugManual').checked = data.manual;
+                document.getElementById('debugWebhook').checked = data.webhook;
+                document.getElementById('debugSchedule').checked = data.schedule;
             } catch (error) {
                 console.error('Error loading debug mode:', error);
             }
         }
 
-        async function applyDebugMode() {
-            const debugSelect = document.getElementById('debugModeSelect');
-            const mode = debugSelect.value;
-
+        async function updateDebugMode(action, enabled) {
             try {
                 const response = await fetch('/api/debug', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
                     },
-                    body: JSON.stringify({ mode: mode })
+                    body: JSON.stringify({ action: action, enabled: enabled })
                 });
 
-                if (!response.ok) throw new Error('Failed to set debug mode');
+                if (!response.ok) throw new Error('Failed to update debug mode');
 
-                const data = await response.json();
+                const actionLabels = {
+                    'manual': 'Manual',
+                    'webhook': 'Webhook',
+                    'schedule': 'Schedule'
+                };
 
-                // Reload to show the new current mode
-                await loadDebugMode();
-
-                if (data.debug_mode) {
-                    showMessage(`Debug mode enabled: ${getDebugModeLabel(data.debug_mode)}`, 'success');
+                if (enabled) {
+                    showMessage(`Debug enabled for ${actionLabels[action]} actions`, 'success');
                 } else {
-                    showMessage('Debug mode disabled - normal operation resumed', 'success');
+                    showMessage(`Debug disabled for ${actionLabels[action]} actions`, 'success');
                 }
             } catch (error) {
-                showMessage(`Error setting debug mode: ${error.message}`, 'error');
+                showMessage(`Error updating debug mode: ${error.message}`, 'error');
+                // Reload to restore correct state
+                await loadDebugMode();
             }
         }
 
@@ -1283,34 +1337,37 @@ def get_status_api():
 @app.route('/api/debug', methods=['GET'])
 @require_auth
 def get_debug_mode_api():
-    """Get current debug mode setting"""
+    """Get current debug mode settings for all action types"""
     return jsonify({
-        'debug_mode': debug_mode_state['mode'],
-        'available_modes': ['', 'webhook', 'schedule', 'manual', 'all']
+        'webhook': debug_mode_state.get('webhook', False),
+        'schedule': debug_mode_state.get('schedule', False),
+        'manual': debug_mode_state.get('manual', False)
     }), 200
 
 
 @app.route('/api/debug', methods=['POST'])
 @require_auth
 def set_debug_mode_api():
-    """Set debug mode"""
+    """Set debug mode for a specific action type"""
     try:
         data = request.get_json()
-        new_mode = data.get('mode', '').lower()
+        action = data.get('action', '').lower()
+        enabled = data.get('enabled', False)
 
-        # Validate mode
-        valid_modes = ['', 'webhook', 'schedule', 'manual', 'all']
-        if new_mode not in valid_modes:
+        # Validate action
+        valid_actions = ['webhook', 'schedule', 'manual']
+        if action not in valid_actions:
             return jsonify({
-                'error': f'Invalid mode. Must be one of: {", ".join(valid_modes)}'
+                'error': f'Invalid action. Must be one of: {", ".join(valid_actions)}'
             }), 400
 
-        debug_mode_state['mode'] = new_mode
-        logger.info(f"Debug mode changed to: '{new_mode}' (empty = disabled)")
+        debug_mode_state[action] = bool(enabled)
+        logger.info(f"Debug mode for '{action}' set to: {enabled}")
 
         return jsonify({
             'status': 'success',
-            'debug_mode': debug_mode_state['mode']
+            'action': action,
+            'enabled': debug_mode_state[action]
         }), 200
     except Exception as e:
         logger.error(f"Error setting debug mode: {e}")
