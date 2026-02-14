@@ -669,17 +669,30 @@ def admin_ui():
         }
         .power-control-bar {
             display: flex;
+            flex-direction: column;
             align-items: center;
-            justify-content: center;
-            gap: 15px;
+            gap: 8px;
             margin-bottom: 25px;
             padding: 12px 20px;
             background: #f8f9fa;
             border-radius: 6px;
         }
+        .power-control-row {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 15px;
+        }
         .power-control-bar .label {
             font-weight: 500;
             color: #555;
+        }
+        .debug-status-line {
+            font-size: 13px;
+            color: #856404;
+            background: rgba(255, 193, 7, 0.2);
+            padding: 4px 12px;
+            border-radius: 4px;
         }
         .power-status {
             display: inline-block;
@@ -811,11 +824,14 @@ def admin_ui():
         <div id="toast" class="toast"></div>
 
         <div class="power-control-bar">
-            <span class="label">Power Status:</span>
-            <span id="powerStatus" class="power-status unknown">...</span>
-            <span class="label" style="margin-left: 10px;">Set Power:</span>
-            <button class="btn-control btn-power-on" onclick="manualPowerControl('on')">ON</button>
-            <button class="btn-control btn-power-off" onclick="manualPowerControl('off')">OFF</button>
+            <div class="power-control-row">
+                <span class="label">Power Status:</span>
+                <span id="powerStatus" class="power-status unknown">...</span>
+                <span class="label" style="margin-left: 10px;">Set Power:</span>
+                <button class="btn-control btn-power-on" onclick="manualPowerControl('on')">ON</button>
+                <button class="btn-control btn-power-off" onclick="manualPowerControl('off')">OFF</button>
+            </div>
+            <div id="debugStatusLine" class="debug-status-line">Debugging: None</div>
         </div>
 
         <div class="form-section">
@@ -1007,9 +1023,27 @@ def admin_ui():
                 document.getElementById('debugManual').checked = data.manual;
                 document.getElementById('debugWebhook').checked = data.webhook;
                 document.getElementById('debugSchedule').checked = data.schedule;
+
+                // Update debug status line in power control bar
+                updateDebugStatusLine(data);
             } catch (error) {
                 console.error('Error loading debug mode:', error);
             }
+        }
+
+        function updateDebugStatusLine(data) {
+            const statusLine = document.getElementById('debugStatusLine');
+            const enabled = [];
+            if (data.manual) enabled.push('Manual');
+            if (data.webhook) enabled.push('Webhook');
+            if (data.schedule) enabled.push('Schedule');
+
+            if (enabled.length > 0) {
+                statusLine.textContent = 'Debugging: ' + enabled.join(', ');
+            } else {
+                statusLine.textContent = 'Debugging: None';
+            }
+            statusLine.style.display = 'block';
         }
 
         async function updateDebugMode(action, enabled) {
@@ -1035,6 +1069,13 @@ def admin_ui():
                 } else {
                     showMessage(`Debug disabled for ${actionLabels[action]} actions`, 'success');
                 }
+
+                // Update the status line with current checkbox states
+                updateDebugStatusLine({
+                    manual: document.getElementById('debugManual').checked,
+                    webhook: document.getElementById('debugWebhook').checked,
+                    schedule: document.getElementById('debugSchedule').checked
+                });
             } catch (error) {
                 showMessage(`Error updating debug mode: ${error.message}`, 'error');
                 // Reload to restore correct state
