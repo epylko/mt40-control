@@ -53,8 +53,12 @@ app = Flask(__name__)
 # Initialize Meraki Dashboard API
 dashboard = meraki.DashboardAPI(API_KEY, suppress_logging=True)
 
-# Initialize scheduler
-scheduler = BackgroundScheduler()
+# Initialize scheduler with explicit timezone and generous misfire grace time
+# misfire_grace_time: if a job fires up to 120s late (e.g., due to DST or load), still run it
+scheduler = BackgroundScheduler(
+    timezone='America/New_York',
+    job_defaults={'misfire_grace_time': 120}
+)
 scheduler.start()
 
 # Event history (keep last 100 events)
@@ -818,7 +822,7 @@ def admin_ui():
             <div id="clock" class="clock">--:--:--</div>
             <h1>MT40 Schedule Manager</h1>
             <p class="subtitle">Manage power on/off schedules</p>
-            <p class="version">v1.2.0</p>
+            <p class="version">v1.2.1</p>
         </div>
 
         <div id="toast" class="toast"></div>
