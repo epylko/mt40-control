@@ -18,7 +18,7 @@ from collections import deque
 from flask import Flask, request, jsonify, Response, render_template_string
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
-from dotenv import load_dotenv
+from dotenv import load_dotenv, set_key
 
 # Load environment variables
 load_dotenv()
@@ -35,6 +35,9 @@ DEBUG_MODE = os.getenv('DEBUG_MODE', '').lower()  # Options: 'webhook', 'schedul
 UI_USERNAME = os.getenv('UI_USERNAME', 'admin')
 UI_PASSWORD = os.getenv('UI_PASSWORD', 'admin')
 LONG_PRESS_TIMEOUT = int(os.getenv('LONG_PRESS_TIMEOUT', 20))  # Seconds to wait for second press
+MISFIRE_GRACE_TIME = int(os.getenv('MISFIRE_GRACE_TIME', 600))
+
+ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
 
 # Setup logging
 logging.basicConfig(
@@ -54,10 +57,10 @@ app = Flask(__name__)
 dashboard = meraki.DashboardAPI(API_KEY, suppress_logging=True)
 
 # Initialize scheduler with explicit timezone and generous misfire grace time
-# misfire_grace_time: if a job fires up to 120s late (e.g., due to DST or load), still run it
+# misfire_grace_time: if a job fires late (e.g., after reboot + NTP sync delay), still run it
 scheduler = BackgroundScheduler(
     timezone='America/New_York',
-    job_defaults={'misfire_grace_time': 120}
+    job_defaults={'misfire_grace_time': MISFIRE_GRACE_TIME}
 )
 scheduler.start()
 
@@ -822,7 +825,7 @@ def admin_ui():
             <div id="clock" class="clock">--:--:--</div>
             <h1>MT40 Schedule Manager</h1>
             <p class="subtitle">Manage power on/off schedules</p>
-            <p class="version">v1.2.1</p>
+            <p class="version">v1.2.2</p>
         </div>
 
         <div id="toast" class="toast"></div>
@@ -834,6 +837,12 @@ def admin_ui():
                 <span class="label" style="margin-left: 10px;">Set Power:</span>
                 <button class="btn-control btn-power-on" onclick="manualPowerControl('on')">ON</button>
                 <button class="btn-control btn-power-off" onclick="manualPowerControl('off')">OFF</button>
+            </div>
+            <div class="power-control-row" style="margin-top: 8px;">
+                <span class="label">Misfire Grace:</span>
+                <input type="number" id="misfireGraceTime" min="30" max="3600" style="width:70px; padding:4px 8px; border:1px solid #ccc; border-radius:4px; font-size:14px;">
+                <span class="label">sec</span>
+                <button class="btn-control" style="background:#6c757d; color:white;" onclick="saveMisfireGraceTime()">Save</button>
             </div>
             <div id="debugStatusLine" class="debug-status-line">Debugging: None</div>
         </div>
@@ -1087,6 +1096,36 @@ def admin_ui():
             }
         }
 
+        async function loadSettings() {
+            try {
+                const response = await fetch('/api/settings');
+                if (!response.ok) throw new Error('Failed to load settings');
+                const data = await response.json();
+                document.getElementById('misfireGraceTime').value = data.misfire_grace_time;
+            } catch (error) {
+                console.error('Error loading settings:', error);
+            }
+        }
+
+        async function saveMisfireGraceTime() {
+            const value = parseInt(document.getElementById('misfireGraceTime').value);
+            if (isNaN(value) || value < 30 || value > 3600) {
+                showMessage('Grace time must be between 30 and 3600 seconds', 'error');
+                return;
+            }
+            try {
+                const response = await fetch('/api/settings', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ misfire_grace_time: value })
+                });
+                if (!response.ok) throw new Error('Failed to save settings');
+                showMessage(`Misfire grace time set to ${value}s`, 'success');
+            } catch (error) {
+                showMessage('Error saving settings: ' + error.message, 'error');
+            }
+        }
+
         function timeToMinutes(timeStr) {
             const [hours, minutes] = timeStr.split(':').map(Number);
             return hours * 60 + minutes;
@@ -1260,6 +1299,7 @@ def admin_ui():
         loadEvents();
         loadPowerStatus();
         loadDebugMode();
+        loadSettings();
         updateClock(); // Initial clock update
 
         // Auto-refresh events and status every 10 seconds
@@ -1416,6 +1456,39 @@ def set_debug_mode_api():
         }), 200
     except Exception as e:
         logger.error(f"Error setting debug mode: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/settings', methods=['GET'])
+@require_auth
+def get_settings_api():
+    """Get current scheduler settings"""
+    return jsonify({'misfire_grace_time': MISFIRE_GRACE_TIME}), 200
+
+
+@app.route('/api/settings', methods=['POST'])
+@require_auth
+def set_settings_api():
+    """Update scheduler settings and persist to .env"""
+    global MISFIRE_GRACE_TIME
+    try:
+        data = request.get_json()
+        value = int(data.get('misfire_grace_time', MISFIRE_GRACE_TIME))
+        if value < 30 or value > 3600:
+            return jsonify({'error': 'misfire_grace_time must be between 30 and 3600'}), 400
+
+        MISFIRE_GRACE_TIME = value
+        set_key(ENV_FILE, 'MISFIRE_GRACE_TIME', str(value))
+
+        for job in scheduler.get_jobs():
+            job.modify(misfire_grace_time=value)
+
+        logger.info(f"Misfire grace time updated to {value}s")
+        return jsonify({'misfire_grace_time': MISFIRE_GRACE_TIME}), 200
+    except (ValueError, TypeError):
+        return jsonify({'error': 'Invalid value'}), 400
+    except Exception as e:
+        logger.error(f"Error updating settings: {e}")
         return jsonify({'error': str(e)}), 500
 
 
