@@ -12,12 +12,13 @@ import json
 import logging
 import gzip
 import shutil
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import wraps
 from collections import deque
 from flask import Flask, request, jsonify, Response, render_template_string
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
 from dotenv import load_dotenv, set_key
 
 # Load environment variables
@@ -237,16 +238,38 @@ def rotate_log():
         logger.error(f"Error during log rotation: {e}")
 
 
-def power_on():
+def power_on(is_retry=False):
     """Turn MT40 power ON - scheduled function"""
-    logger.info("⚡ Scheduled power ON triggered")
-    control_mt40_power('on', source='schedule')
+    label = "⚡ Scheduled power ON retry" if is_retry else "⚡ Scheduled power ON triggered"
+    logger.info(label)
+    success = control_mt40_power('on', source='schedule')
+    if not success and not is_retry:
+        retry_time = datetime.now() + timedelta(minutes=2)
+        scheduler.add_job(
+            func=lambda: power_on(is_retry=True),
+            trigger=DateTrigger(run_date=retry_time),
+            id='retry_power_on',
+            name='Retry Power ON',
+            replace_existing=True
+        )
+        logger.warning(f"Power ON failed — retry scheduled for {retry_time.strftime('%H:%M:%S')}")
 
 
-def power_off():
+def power_off(is_retry=False):
     """Turn MT40 power OFF - scheduled function"""
-    logger.info("⏻ Scheduled power OFF triggered")
-    control_mt40_power('off', source='schedule')
+    label = "⏻ Scheduled power OFF retry" if is_retry else "⏻ Scheduled power OFF triggered"
+    logger.info(label)
+    success = control_mt40_power('off', source='schedule')
+    if not success and not is_retry:
+        retry_time = datetime.now() + timedelta(minutes=2)
+        scheduler.add_job(
+            func=lambda: power_off(is_retry=True),
+            trigger=DateTrigger(run_date=retry_time),
+            id='retry_power_off',
+            name='Retry Power OFF',
+            replace_existing=True
+        )
+        logger.warning(f"Power OFF failed — retry scheduled for {retry_time.strftime('%H:%M:%S')}")
 
 
 def load_schedules():
@@ -825,7 +848,7 @@ def admin_ui():
             <div id="clock" class="clock">--:--:--</div>
             <h1>MT40 Schedule Manager</h1>
             <p class="subtitle">Manage power on/off schedules</p>
-            <p class="version">v1.2.2</p>
+            <p class="version">v1.3.0</p>
         </div>
 
         <div id="toast" class="toast"></div>
@@ -848,7 +871,10 @@ def admin_ui():
         </div>
 
         <div class="form-section">
-            <h2>Current Schedules</h2>
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+                <h2 style="margin:0">Current Schedules</h2>
+                <button class="btn-primary" onclick="addInlineRow()">+ Add</button>
+            </div>
             <table>
                 <thead>
                     <tr>
@@ -868,46 +894,6 @@ def admin_ui():
             </table>
         </div>
 
-        <div class="form-section">
-            <h2>Add New Schedule</h2>
-            <form id="addForm">
-                <div class="form-row">
-                    <div class="form-group">
-                        <label>Name</label>
-                        <input type="text" id="name" required placeholder="e.g., Morning ON">
-                    </div>
-                    <div class="form-group">
-                        <label>Action</label>
-                        <select id="action" required>
-                            <option value="on">Power ON</option>
-                            <option value="off">Power OFF</option>
-                        </select>
-                    </div>
-                    <div class="form-group">
-                        <label>Time</label>
-                        <input type="time" id="time" required>
-                    </div>
-                    <div class="form-group">
-                        <label>Days</label>
-                        <select id="days" required>
-                            <option value="daily">Daily</option>
-                            <option value="mon-fri">Weekdays (Mon-Fri)</option>
-                            <option value="weekends">Weekends (Sat-Sun)</option>
-                            <option value="mon">Monday</option>
-                            <option value="tue">Tuesday</option>
-                            <option value="wed">Wednesday</option>
-                            <option value="thu">Thursday</option>
-                            <option value="fri">Friday</option>
-                            <option value="sat">Saturday</option>
-                            <option value="sun">Sunday</option>
-                        </select>
-                    </div>
-                    <div class="form-group">
-                        <button type="submit" class="btn-primary">Add</button>
-                    </div>
-                </div>
-            </form>
-        </div>
 
         <div class="form-section">
             <h2>Recent Events</h2>
@@ -1165,6 +1151,7 @@ def admin_ui():
                     <td>${schedule.days}</td>
                     <td><span class="status-badge status-${schedule.enabled ? 'enabled' : 'disabled'}">${schedule.enabled ? 'Enabled' : 'Disabled'}</span></td>
                     <td class="actions">
+                        <button class="btn-secondary" onclick="editSchedule(${index})">Edit</button>
                         <button class="btn-secondary" onclick="toggleSchedule(${index})">${schedule.enabled ? 'Disable' : 'Enable'}</button>
                         <button class="btn-danger" onclick="deleteSchedule(${index})">Delete</button>
                     </td>
@@ -1201,23 +1188,98 @@ def admin_ui():
             }
         }
 
-        document.getElementById('addForm').addEventListener('submit', async (e) => {
-            e.preventDefault();
+        function esc(str) {
+            return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+        }
 
-            const newSchedule = {
-                name: document.getElementById('name').value,
-                action: document.getElementById('action').value,
-                time: document.getElementById('time').value,
-                days: document.getElementById('days').value,
-                enabled: true
+        function daysOptions(selected) {
+            const opts = [
+                ['daily','Daily'],['mon-fri','Weekdays (Mon-Fri)'],['weekends','Weekends (Sat-Sun)'],
+                ['mon','Monday'],['tue','Tuesday'],['wed','Wednesday'],['thu','Thursday'],
+                ['fri','Friday'],['sat','Saturday'],['sun','Sunday']
+            ];
+            return opts.map(([v,l]) => `<option value="${v}"${v===selected?' selected':''}>${l}</option>`).join('');
+        }
+
+        function editSchedule(index) {
+            const s = schedules[index];
+            const tbody = document.getElementById('scheduleTable');
+            const rows = tbody.querySelectorAll('tr');
+            rows[index].innerHTML = `
+                <td><input type="text" value="${esc(s.name)}" id="edit_name_${index}" style="width:100%"></td>
+                <td><select id="edit_action_${index}">
+                    <option value="on"${s.action==='on'?' selected':''}>ON</option>
+                    <option value="off"${s.action==='off'?' selected':''}>OFF</option>
+                </select></td>
+                <td><input type="time" value="${esc(s.time)}" id="edit_time_${index}"></td>
+                <td><select id="edit_days_${index}">${daysOptions(s.days)}</select></td>
+                <td><span class="status-badge status-${s.enabled ? 'enabled' : 'disabled'}">${s.enabled ? 'Enabled' : 'Disabled'}</span></td>
+                <td class="actions">
+                    <button class="btn-primary" onclick="saveInlineEdit(${index})">Save</button>
+                    <button class="btn-secondary" onclick="renderSchedules()">Cancel</button>
+                </td>
+            `;
+            document.getElementById(`edit_name_${index}`).focus();
+        }
+
+        async function saveInlineEdit(index) {
+            schedules[index] = {
+                ...schedules[index],
+                name: document.getElementById(`edit_name_${index}`).value,
+                action: document.getElementById(`edit_action_${index}`).value,
+                time: document.getElementById(`edit_time_${index}`).value,
+                days: document.getElementById(`edit_days_${index}`).value,
             };
-
-            schedules.push(newSchedule);
             await saveSchedules();
+        }
 
-            // Reset form
-            e.target.reset();
-        });
+        function addInlineRow() {
+            const tbody = document.getElementById('scheduleTable');
+            if (tbody.querySelector('tr[data-new]')) return;
+            const emptyRow = tbody.querySelector('tr td[colspan]');
+            if (emptyRow) emptyRow.parentElement.remove();
+            const tr = document.createElement('tr');
+            tr.setAttribute('data-new', '1');
+            tr.innerHTML = `
+                <td><input type="text" id="new_name" style="width:100%" placeholder="e.g., Morning ON"></td>
+                <td><select id="new_action">
+                    <option value="on">ON</option>
+                    <option value="off">OFF</option>
+                </select></td>
+                <td><input type="time" id="new_time"></td>
+                <td><select id="new_days">${daysOptions('mon-fri')}</select></td>
+                <td></td>
+                <td class="actions">
+                    <button class="btn-primary" onclick="saveNewInline()">Save</button>
+                    <button class="btn-secondary" onclick="cancelNewInline()">Cancel</button>
+                </td>
+            `;
+            tbody.appendChild(tr);
+            document.getElementById('new_name').focus();
+        }
+
+        function cancelNewInline() {
+            const tr = document.querySelector('tr[data-new]');
+            if (tr) tr.remove();
+            if (schedules.length === 0) renderSchedules();
+        }
+
+        async function saveNewInline() {
+            const name = document.getElementById('new_name').value.trim();
+            const time = document.getElementById('new_time').value;
+            if (!name || !time) {
+                showMessage('Name and time are required', 'error');
+                return;
+            }
+            schedules.push({
+                name,
+                action: document.getElementById('new_action').value,
+                time,
+                days: document.getElementById('new_days').value,
+                enabled: true
+            });
+            await saveSchedules();
+        }
 
         async function toggleSchedule(index) {
             schedules[index].enabled = !schedules[index].enabled;
