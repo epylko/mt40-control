@@ -12,6 +12,7 @@ import json
 import logging
 import gzip
 import shutil
+import time
 from datetime import datetime, timedelta
 from functools import wraps
 from collections import deque
@@ -19,6 +20,11 @@ from flask import Flask, request, jsonify, Response, render_template_string
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
+from apscheduler.events import (
+    EVENT_JOB_EXECUTED, EVENT_JOB_ERROR, EVENT_JOB_MISSED,
+    EVENT_SCHEDULER_SHUTDOWN, EVENT_SCHEDULER_PAUSED, EVENT_SCHEDULER_RESUMED,
+    EVENT_JOB_ADDED, EVENT_JOB_REMOVED,
+)
 from dotenv import load_dotenv, set_key
 
 # Load environment variables
@@ -37,6 +43,8 @@ UI_USERNAME = os.getenv('UI_USERNAME', 'admin')
 UI_PASSWORD = os.getenv('UI_PASSWORD', 'admin')
 LONG_PRESS_TIMEOUT = int(os.getenv('LONG_PRESS_TIMEOUT', 20))  # Seconds to wait for second press
 MISFIRE_GRACE_TIME = int(os.getenv('MISFIRE_GRACE_TIME', 600))
+POWER_VERIFY_TIMEOUT = int(os.getenv('POWER_VERIFY_TIMEOUT', 20))  # Seconds to wait for device to confirm state change
+POWER_VERIFY_POLL_INTERVAL = int(os.getenv('POWER_VERIFY_POLL_INTERVAL', 4))  # Seconds between state polls
 
 ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
 
@@ -64,6 +72,43 @@ scheduler = BackgroundScheduler(
     job_defaults={'misfire_grace_time': MISFIRE_GRACE_TIME}
 )
 scheduler.start()
+
+
+def _on_scheduler_event(event):
+    """APScheduler event listener — logs anything unexpected for post-mortem debugging."""
+    code = event.code
+    if code == EVENT_SCHEDULER_SHUTDOWN:
+        logger.error("[SCHEDULER] Scheduler has SHUT DOWN — jobs will no longer fire")
+    elif code == EVENT_SCHEDULER_PAUSED:
+        logger.warning("[SCHEDULER] Scheduler PAUSED")
+    elif code == EVENT_SCHEDULER_RESUMED:
+        logger.info("[SCHEDULER] Scheduler resumed")
+    elif code == EVENT_JOB_ADDED:
+        logger.info(f"[SCHEDULER] Job added: {event.job_id}")
+    elif code == EVENT_JOB_REMOVED:
+        logger.info(f"[SCHEDULER] Job removed: {event.job_id}")
+    elif code == EVENT_JOB_MISSED:
+        logger.warning(
+            f"[SCHEDULER] Job MISSED: {event.job_id} "
+            f"(was scheduled for {event.scheduled_run_time})"
+        )
+    elif code == EVENT_JOB_ERROR:
+        logger.error(
+            f"[SCHEDULER] Job ERROR: {event.job_id} — {event.exception}\n{event.traceback}"
+        )
+    elif code == EVENT_JOB_EXECUTED:
+        logger.info(
+            f"[SCHEDULER] Job executed: {event.job_id} "
+            f"(scheduled {event.scheduled_run_time})"
+        )
+
+
+scheduler.add_listener(
+    _on_scheduler_event,
+    EVENT_JOB_EXECUTED | EVENT_JOB_ERROR | EVENT_JOB_MISSED |
+    EVENT_SCHEDULER_SHUTDOWN | EVENT_SCHEDULER_PAUSED | EVENT_SCHEDULER_RESUMED |
+    EVENT_JOB_ADDED | EVENT_JOB_REMOVED,
+)
 
 # Event history (keep last 100 events)
 event_history = deque(maxlen=100)
@@ -114,6 +159,69 @@ def get_network_id():
         return None
 
 
+def get_power_state():
+    """
+    Query the MT40's actual current downstream power state from its sensor reading
+    (independent of any command that may or may not have taken effect).
+
+    Returns:
+        tuple: (state, last_update) where state is 'on', 'off', or 'unknown'
+    """
+    readings = dashboard.sensor.getOrganizationSensorReadingsLatest(
+        ORG_ID,
+        serials=[MT40_SERIAL],
+        metrics=['downstreamPower']
+    )
+
+    state = 'unknown'
+    last_update = None
+
+    for reading in readings:
+        if reading.get('serial') == MT40_SERIAL:
+            for r in reading.get('readings', []):
+                if r.get('metric') == 'downstreamPower':
+                    enabled = r.get('downstreamPower', {}).get('enabled')
+                    if enabled is not None:
+                        state = 'on' if enabled else 'off'
+                    last_update = r.get('ts')
+                    break
+            break
+
+    return state, last_update
+
+
+def verify_power_state(expected_state, timeout_seconds=POWER_VERIFY_TIMEOUT,
+                        poll_interval=POWER_VERIFY_POLL_INTERVAL):
+    """
+    Poll the MT40's actual power reading until it matches expected_state, or
+    timeout_seconds elapses. A command being accepted by the Meraki API (status
+    'pending') doesn't mean it was actually carried out by the device — this
+    confirms it against the real sensor reading before we call it a success.
+
+    Args:
+        expected_state: 'on' or 'off'
+        timeout_seconds: how long to keep polling before giving up
+        poll_interval: seconds between polls
+
+    Returns:
+        bool: True if the device reported expected_state within the timeout
+    """
+    deadline = datetime.now() + timedelta(seconds=timeout_seconds)
+
+    while True:
+        try:
+            actual_state, _ = get_power_state()
+            if actual_state == expected_state:
+                return True
+        except Exception as e:
+            logger.warning(f"Error polling power state during verification: {e}")
+
+        if datetime.now() >= deadline:
+            return False
+
+        time.sleep(poll_interval)
+
+
 def control_mt40_power(action, source='unknown'):
     """
     Control MT40 downstream power state
@@ -161,12 +269,37 @@ def control_mt40_power(action, source='unknown'):
 
         command_id = response.get('commandId', 'unknown')
         status = response.get('status', 'unknown')
-        logger.info(f"✓ MT40 power {action.upper()} command sent successfully (ID: {command_id}, Status: {status})")
+        logger.info(f"✓ MT40 power {action.upper()} command accepted by Meraki (ID: {command_id}, Status: {status})")
         logger.debug(f"Full response: {response}")
 
         # Log if there are immediate errors
         if response.get('errors'):
             logger.warning(f"Command queued but has errors: {response.get('errors')}")
+
+        # Meraki accepting the command (status: pending) doesn't mean the device
+        # actually carried it out — confirm against the real sensor reading before
+        # calling it a success, so a stuck/dropped command is treated as a failure
+        # and triggers the normal retry path instead of going unnoticed.
+        logger.info(f"Verifying MT40 actually reached '{action}' state (up to {POWER_VERIFY_TIMEOUT}s)...")
+        confirmed = verify_power_state(action)
+
+        if not confirmed:
+            actual_state, _ = get_power_state()
+            logger.error(
+                f"✗ MT40 power {action.upper()} command was accepted (ID: {command_id}) but device "
+                f"did not confirm the state change within {POWER_VERIFY_TIMEOUT}s "
+                f"(still reads '{actual_state}')"
+            )
+            event_history.append({
+                'timestamp': datetime.now().isoformat(),
+                'action': action,
+                'source': source,
+                'status': 'unconfirmed',
+                'error': f"Command accepted (ID: {command_id}) but device still reads '{actual_state}'"
+            })
+            return False
+
+        logger.info(f"✓ MT40 power {action.upper()} confirmed (ID: {command_id})")
 
         # Log event
         event_history.append({
@@ -200,6 +333,31 @@ def control_mt40_power(action, source='unknown'):
             'error': str(e)
         })
         return False
+
+
+def scheduler_heartbeat():
+    """Hourly health check — logs scheduler thread state and upcoming job times."""
+    thread = scheduler._thread
+    thread_alive = thread is not None and thread.is_alive()
+    now = datetime.now(scheduler.timezone)
+    jobs = scheduler.get_jobs()
+
+    logger.info(
+        f"[HEARTBEAT] state={scheduler.state} thread_alive={thread_alive} "
+        f"job_count={len(jobs)}"
+    )
+    for job in jobs:
+        if job.next_run_time:
+            secs = (job.next_run_time - now).total_seconds()
+            logger.info(
+                f"[HEARTBEAT]   {job.name} → next in {secs:.0f}s "
+                f"({job.next_run_time.strftime('%Y-%m-%d %H:%M:%S %Z')})"
+            )
+        else:
+            logger.warning(f"[HEARTBEAT]   {job.name} → next_run_time is None (paused or broken?)")
+
+    if not thread_alive:
+        logger.error("[HEARTBEAT] Scheduler thread is DEAD — jobs will not fire!")
 
 
 def rotate_log():
@@ -356,6 +514,16 @@ def load_schedules():
         replace_existing=True
     )
     logger.info("Log rotation scheduled for 1st of each month at midnight")
+
+    # Hourly heartbeat for scheduler health diagnostics
+    scheduler.add_job(
+        func=scheduler_heartbeat,
+        trigger=CronTrigger(minute=0),
+        id='scheduler_heartbeat',
+        name='Scheduler Heartbeat',
+        replace_existing=True
+    )
+    logger.info("Scheduler heartbeat registered (fires every hour)")
 
 
 @app.route('/webhook', methods=['POST', 'GET'])
@@ -848,7 +1016,7 @@ def admin_ui():
             <div id="clock" class="clock">--:--:--</div>
             <h1>MT40 Schedule Manager</h1>
             <p class="subtitle">Manage power on/off schedules</p>
-            <p class="version">v1.3.0</p>
+            <p class="version">v1.4.0</p>
         </div>
 
         <div id="toast" class="toast"></div>
@@ -1327,6 +1495,9 @@ def admin_ui():
                 } else if (event.status === 'failed') {
                     statusClass = 'status-disabled';
                     statusText = event.error ? `Failed: ${event.error}` : 'Failed';
+                } else if (event.status === 'unconfirmed') {
+                    statusClass = 'status-disabled';
+                    statusText = event.error ? `Unconfirmed: ${event.error}` : 'Unconfirmed';
                 } else if (event.status === 'debug_skipped') {
                     statusClass = 'status-disabled';
                     statusText = 'Debug Skipped';
@@ -1450,27 +1621,7 @@ def get_events_api():
 def get_status_api():
     """Get current MT40 power status"""
     try:
-        # Query the actual current state from the dashboard
-        readings = dashboard.sensor.getOrganizationSensorReadingsLatest(
-            ORG_ID,
-            serials=[MT40_SERIAL],
-            metrics=['downstreamPower']
-        )
-
-        current_state = 'unknown'
-        last_update = None
-
-        for reading in readings:
-            if reading.get('serial') == MT40_SERIAL:
-                downstream_power = reading.get('readings', [])
-                for r in downstream_power:
-                    if r.get('metric') == 'downstreamPower':
-                        enabled = r.get('downstreamPower', {}).get('enabled')
-                        if enabled is not None:
-                            current_state = 'on' if enabled else 'off'
-                        last_update = r.get('ts')
-                        break
-                break
+        current_state, last_update = get_power_state()
 
         return jsonify({
             'power_state': current_state,
